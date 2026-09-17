@@ -66,7 +66,8 @@ DEFAULT_NOISE_BANK_DIR = ICBHI_DERIVED
 
 ICBHI_CLASS_NAMES = [LABEL_NAMES[i] for i in range(4)]
 SR = 16000
-
+SEC = 10.0
+N_SAMPLES = int(SEC * SR)
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -88,12 +89,14 @@ class Trainer:
                   "denoiser 가 항등함수를 배우는 것이 최적해가 된다.")
         train_ds, eval_ds = build_icbhi_datasets(args)
         print(f"[data] fold={args.fold} train={len(train_ds):,} test={len(eval_ds):,}")
+
         self.train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                        drop_last=True, num_workers=args.num_workers,
                                        pin_memory=self.device.type == "cuda")
         self.eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False,
                                       num_workers=args.num_workers,
                                       pin_memory=self.device.type == "cuda")
+
         self.noise_bank = None
         if self.need_noise:
             if not Path(args.noise_bank).exists():
@@ -111,9 +114,12 @@ class Trainer:
                 noise_train_ids,
                 noise_test_ids,
             )
+
             self.noise_bank = NoiseBank(args.noise_bank, seed=args.seed)
+
             exclude_eval_sources(self.noise_bank, eval_ds.sample_ids)
             leaked = self.noise_bank.check_leakage(eval_ds.sample_ids)
+
             if leaked:
                 raise RuntimeError(
                     f"noise bank에 test split {len(leaked)} ids 누수: "
@@ -124,15 +130,18 @@ class Trainer:
                       f"eval 과 교집합 0)")
         else:
             print("[noise] 잡음 주입·복원 손실·denoising 지표 모두 비활성 (A arm)")
+
         channels = tuple(int(c) for c in str(args.channels).split(",") if c.strip())
         dilations = tuple(int(d) for d in str(args.dilations).split(",") if d.strip())
+
         self.model_cfg = dict(in_channels=1, channels=channels,
                               kernel=args.kernel, stride=args.stride,
                               use_skip=not args.no_skip, predict=args.predict,
                               dilations=dilations)
-        dae = None if args.no_denoise else DUNet(**self.model_cfg)
+
+        dunet = None if args.no_denoise else DUNet(**self.model_cfg)
         self.model: nn.Module = NyTTClassifier(
-            dae, num_classes=args.num_classes, base=args.cls_base,
+            dunet, num_classes=args.num_classes, base=args.cls_base,
             dropout=args.dropout,
             mel_normalize=args.mel_normalize, top_db=args.top_db,
             cls_dim=args.cls_dim,
@@ -148,16 +157,20 @@ class Trainer:
             cls_view_reduced_dim=args.cls_view_reduced_dim,
             cls_view_dim=parse_view_freq_keep(args.cls_view_dim),
         ).to(self.device)
+
         if self.device.type == "cuda" and torch.cuda.device_count() > 1:
             print(f"Using DataParallel with {torch.cuda.device_count()} GPUs")
             self.model = nn.DataParallel(self.model)
         self.core = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
         self.class_names = list(ICBHI_CLASS_NAMES)[:args.num_classes]
         w = train_ds.class_weights(args.num_classes).to(self.device)
+
         stft_ffts = (tuple(int(v) for v in str(args.stft_ffts).split(",") if v.strip())
                      if args.stft_ffts else None)
         stft_fmax = None if (args.stft_fmax_hz is None or args.stft_fmax_hz <= 0) \
             else float(args.stft_fmax_hz)
+
         self.train_loss = TrainingLoss(
             class_weights=w if args.use_class_weight else None,
             use_dnet=self.denoise,
@@ -169,6 +182,7 @@ class Trainer:
             aux_ce_weight=args.aux_ce_weight,
             aux_use_class_weight=args.aux_use_class_weight,
         ).to(self.device)
+
         self.optimizer = optim.AdamW(self.model.parameters(), lr=args.lr,
                                      weight_decay=args.weight_decay)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer,
@@ -176,6 +190,7 @@ class Trainer:
         self.amp = (self.device.type == "cuda") and not args.no_amp
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
         Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+
     def _make_pair(self, x_target, snr_db=None):
         b, _, t = x_target.shape
         noise = torch.as_tensor(self.noise_bank.sample(t, batch=b),
@@ -185,27 +200,34 @@ class Trainer:
             snr_db = (torch.rand(b, device=x_target.device)
                       * (self.args.snr_max - self.args.snr_min) + self.args.snr_min)
         return mix_at_snr(x_target, noise, snr_db), noise
+
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
+
         total, total_rec, total_cls, n = 0.0, 0.0, 0.0, 0
         tr_preds, tr_reals = [], []
+
         for batch_idx, (data, target) in enumerate(self.train_loader, start=1):
             self.optimizer.zero_grad(set_to_none=True)
             x_target = data.to(torch.float32).to(self.device, non_blocking=True)
             y = target.long().to(self.device, non_blocking=True)
+
             if self.noise_aug:
                 with torch.no_grad():
                     x_in, _ = self._make_pair(x_target)
             else:
                 x_in = x_target
+
             with torch.cuda.amp.autocast(enabled=self.amp):
                 x_hat, logits = self.model(x_in)
                 loss, loss_rec, loss_cls = self.train_loss(
                     x_hat, x_target, logits, y)
+
             if not torch.isfinite(loss):
                 raise FloatingPointError(
                     f"non-finite loss: epoch={epoch}, batch={batch_idx}"
                 )
+
             self.scaler.scale(loss).backward()
             if self.args.grad_clip and self.args.grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
@@ -216,7 +238,9 @@ class Trainer:
                 )
             self.scaler.step(self.optimizer)
             self.scaler.update()
+
             bs = x_target.size(0)
+
             with torch.no_grad():
                 tr_preds.append(logits.detach().float().argmax(dim=1).cpu())
                 tr_reals.append(y.cpu())
@@ -231,10 +255,12 @@ class Trainer:
         n = max(n, 1)
         out = {"train_loss": total / n, "train_rec": total_rec / n,
                "train_cls": total_cls / n}
+
         if tr_reals:
             cls_tr = calculate_classification_metrics(
                 torch.cat(tr_preds).numpy(), torch.cat(tr_reals).numpy(),
                 num_classes=self.args.num_classes)
+
             print(f"[Train {epoch:03d}] loss={out['train_loss']:.4f} "
                   f"Acc={cls_tr['accuracy']*100:.2f} "
                   f"F1={cls_tr['f1_macro']*100:.2f} "
@@ -243,13 +269,17 @@ class Trainer:
                   f"ICBHI={cls_tr['score_icbhi']*100:.2f} "
                   f"(Se {cls_tr['se_icbhi']*100:.2f}"
                   f"/Sp {cls_tr['sp_icbhi']*100:.2f})")
+
             out.update({f"train_cls_{k}": v for k, v in cls_tr.items()
                         if np.isscalar(v)})
         return out
+
     @torch.inference_mode()
     def eval_one_epoch(self, epoch: int, tag: str | None = None):
         self.model.eval()
+
         acc = dict(cls_loss=0.0)
+
         if self.denoise:
             acc.update(si_sdr_in=0.0, si_sdr_out=0.0, l1=0.0, identity_si_sdr=0.0)
         supp, retain, n_count, n_batch = 0.0, 0.0, 0, 0
@@ -264,23 +294,27 @@ class Trainer:
             torch.manual_seed(self.args.seed)
             if self.need_noise:
                 self.noise_bank.rng = np.random.default_rng(self.args.seed)
-        dae = self.core.dae
+        dunet = self.core.dunet
+
         for batch_idx, (data, target) in enumerate(self.eval_loader, start=1):
             x_target = data.to(torch.float32).to(self.device, non_blocking=True)
             y = target.long().to(self.device, non_blocking=True)
             x_id, logits = self.model(x_target)
             bs = x_target.size(0)
             acc["cls_loss"] += float(self.train_loss.criterion(logits, y)) * bs
+
             n_count += bs
             preds_all.append(logits.argmax(dim=1).detach().cpu())
             reals_all.append(y.detach().cpu())
             probs_all.append(torch.softmax(logits.float(), dim=1).detach().cpu())
+
             if getattr(self, "_dist_on", False):
                 with torch.no_grad():
                     m = self.core.extract_mels(x_target)
                     if isinstance(m, list):
                         m = m[0]
                     dist_prof.append(m.mean(dim=(1, 3)).float().cpu())
+
             if self.denoise:
                 snr = torch.full((bs,), self.args.eval_snr, device=self.device)
                 x_in, noise = self._make_pair(x_target, snr_db=snr)
@@ -288,23 +322,30 @@ class Trainer:
                 acc["si_sdr_in"] += si_sdr(x_in, x_target).mean().item() * bs
                 acc["si_sdr_out"] += si_sdr(x_hat, x_target).mean().item() * bs
                 acc["l1"] += (x_hat - x_target).abs().mean().item() * bs
-                supp += energy_ratio_db(dae, noise)
-                retain += -energy_ratio_db(dae, x_target)
+                supp += energy_ratio_db(dunet, noise)
+                retain += -energy_ratio_db(dunet, x_target)
                 acc["identity_si_sdr"] += si_sdr(x_id, x_target).mean().item() * bs
                 n_batch += 1
+
             if self.args.max_eval_batches and batch_idx >= self.args.max_eval_batches:
                 break
+
         if saved_bank_rng is not None:
             self.noise_bank.rng = saved_bank_rng
+
         r = {k: v / max(n_count, 1) for k, v in acc.items()}
+
         if self.denoise:
             r["si_sdri"] = r["si_sdr_out"] - r["si_sdr_in"]
             r["noise_suppression_db"] = supp / max(n_batch, 1)
             r["signal_retention_db"] = retain / max(n_batch, 1)
+
         y_pred = torch.cat(preds_all).numpy()
         y_true = torch.cat(reals_all).numpy()
         y_prob = torch.cat(probs_all).numpy()
+
         self._last_scores = (y_prob, y_true)
+
         if getattr(self, "_dist_on", False) and dist_prof:
             front = (self.core.view_frontends[0]
                      if self.core.view_frontends is not None
@@ -317,12 +358,14 @@ class Trainer:
                 self.class_names,
                 Path(self.args.save_dir)
                 / f"{self.args.model_name}_distribution.png")
+
         cls = calculate_classification_metrics(y_pred, y_true,
                                                num_classes=self.args.num_classes,
                                                probs=y_prob)
 
         r.update({f"cls_{k}": v for k, v in cls.items() if not isinstance(v, list)})
         head = (f"[Epoch]: {epoch:03d} => " if tag is None else f"[{tag}] ")
+
         print(head
               + f"[Acc] : {cls['accuracy']*100:.2f} "
                 f"[F1] : {cls['f1_macro']*100:.2f} "
@@ -331,11 +374,13 @@ class Trainer:
                 f"[ICBHI] : {cls['score_icbhi']*100:.2f} "
                 f"[AUROC] : {cls.get('auroc_macro', float('nan')):.3f} "
                 f"[AUPRC] : {cls.get('auprc_macro', float('nan')):.3f}")
+
         if all(k in cls for k in ("sensitivity_icbhi", "specificity_icbhi")):
             print(" " * len(head)
                   + f"| [ICBHI Se] : {cls['sensitivity_icbhi']*100:.2f} "
                     f"[ICBHI Sp] : {cls['specificity_icbhi']*100:.2f}  "
                     f"(macro Se/Sp 와 다른 정의)")
+
         if self.denoise:
             print(" " * len(head)
                   + f"| [SI-SDRi] : {r['si_sdri']:+.2f} dB "
@@ -343,6 +388,7 @@ class Trainer:
                     f"[SigRetain] : {r['signal_retention_db']:+.2f} dB "
                     f"[Identity] : {r['identity_si_sdr']:+.1f} dB")
         return r, cls
+
     def run(self):
         save_dir = Path(self.args.save_dir)
         select_on = self.args.select_on
@@ -352,6 +398,7 @@ class Trainer:
         ckpt_path = save_dir / f"{self.args.model_name}_best.pt"
         results, best = [], -1e9
         best_epoch = -1
+
         for epoch in range(1, self.args.epochs + 1):
             tr = self.train_one_epoch(epoch)
             r = {"epoch": epoch, **tr}
@@ -374,9 +421,11 @@ class Trainer:
                             "best_metric": self.args.best_metric,
                             "best_value": best},
                            ckpt_path)
+
         pd.DataFrame(results).to_csv(
             save_dir / f"{self.args.model_name}_metrics.csv",
             index=False, encoding="utf-8-sig")
+
         if best_epoch < 0:
             print("\n[warn] epoch 을 한 번도 돌지 않아 보고할 결과가 없다")
             print(f"저장: {save_dir}")
@@ -384,20 +433,24 @@ class Trainer:
 
         ckpt = torch.load(ckpt_path, map_location=self.device)
         self.core.load_state_dict(ckpt["model"])
+
         print("\n" + "=" * 78)
         print(f"FINAL — {select_on} 기준으로 고른 epoch {best_epoch}"
               f" / {self.args.epochs}  ({self.args.best_metric} = {best*100:.2f})"
               f" 의 체크포인트로 test 1회 평가")
         print("=" * 78)
+
         self._dist_on = bool(self.args.distribution)
         _, best_cls = self.eval_one_epoch(best_epoch, tag="TEST")
         self._dist_on = False
         scores, labels = self._last_scores
+
         np.savez_compressed(
             save_dir / f"{self.args.model_name}_best_scores.npz",
             probs=scores, labels=labels, epoch=best_epoch,
             class_names=np.array(self.class_names),
             best_metric=self.args.best_metric, best_value=best)
+
         print_final_table(best_cls, self.class_names,
                           self.args.model_name, per_class_sp="icbhi")
         csv_path = classification_metrics_to_csv(
