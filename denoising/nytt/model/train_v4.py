@@ -126,9 +126,9 @@ class Trainer:
                               kernel=args.kernel, stride=args.stride,
                               use_skip=not args.no_skip, predict=args.predict,
                               dilations=dilations)
-        dae = None if args.no_denoise else DUNet(**self.model_cfg)
+        dunet = None if args.no_denoise else DUNet(**self.model_cfg)
         self.model: nn.Module = NyTTClassifier(
-            dae, num_classes=args.num_classes, base=args.cls_base,
+            dunet, num_classes=args.num_classes, base=args.cls_base,
             dropout=args.dropout,
             mel_normalize=args.mel_normalize, top_db=args.top_db,
             cls_dim=args.cls_dim,
@@ -265,7 +265,7 @@ class Trainer:
             torch.manual_seed(self.args.seed)
             if self.need_noise:
                 self.noise_bank.rng = np.random.default_rng(self.args.seed)
-        dae = self.core.dae
+        dunet = self.core.dunet
         for batch_idx, (data, target) in enumerate(self.eval_loader, start=1):
             x_target = data.to(torch.float32).to(self.device, non_blocking=True)
             y = target.long().to(self.device, non_blocking=True)
@@ -283,8 +283,8 @@ class Trainer:
                 acc["si_sdr_in"] += si_sdr(x_in, x_target).mean().item() * bs
                 acc["si_sdr_out"] += si_sdr(x_hat, x_target).mean().item() * bs
                 acc["l1"] += (x_hat - x_target).abs().mean().item() * bs
-                supp += energy_ratio_db(dae, noise)
-                retain += -energy_ratio_db(dae, x_target)
+                supp += energy_ratio_db(dunet, noise)
+                retain += -energy_ratio_db(dunet, x_target)
                 acc["identity_si_sdr"] += si_sdr(x_id, x_target).mean().item() * bs
                 n_batch += 1
             if self.args.max_eval_batches and batch_idx >= self.args.max_eval_batches:
