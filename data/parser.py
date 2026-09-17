@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from utils import label_ids, matched_ids as cohort_matched_ids
+from data.utils import label_ids, matched_ids as cohort_matched_ids
 
 # (path, label_id, sample_id, cycle_idx) — cycle_data_loader.CycleItem 과 동일한 순서
 SegmentItem = Tuple[Path, int, str, int]
@@ -146,6 +146,30 @@ class SegmentMelParser:
         return self.exclude_label            # 복합 라벨
 
     # ------------------------------------------------------------------ 매칭
+    def _iter_segment_files(self):
+        """Find segment files through mounted/symlinked server directories."""
+        suffix = self.suffix.casefold()
+        seen_directories: set[Path] = set()
+        seen_files: set[Path] = set()
+        for root, directories, files in os.walk(
+            self.mel_base_path, followlinks=True
+        ):
+            resolved_root = Path(root).resolve()
+            if resolved_root in seen_directories:
+                directories.clear()
+                continue
+            seen_directories.add(resolved_root)
+            directories.sort()
+            for name in sorted(files):
+                if not name.casefold().endswith(suffix):
+                    continue
+                path = Path(root) / name
+                resolved_path = path.resolve()
+                if resolved_path in seen_files:
+                    continue
+                seen_files.add(resolved_path)
+                yield path
+
     def build_sample_items(self) -> List[Tuple[str, List[SegmentItem]]]:
         """[(sample_id, [(path, label_id, sample_id, cycle_idx), ...]), ...]"""
         by_id: Dict[str, List[SegmentItem]] = {}
@@ -155,9 +179,10 @@ class SegmentMelParser:
         self.no_label_file: List[str] = []  # 엑셀을 못 찾음
         self.out_of_range: List[str] = []   # cycle_idx 가 엑셀 행 수를 넘음
         self.mismatch: List[Tuple[str, str, str]] = []   # 엑셀 라벨 ≠ 파일명 라벨
+        self.filename_label_fallback: List[str] = []
         self.dropped: Dict[str, int] = {}
 
-        for path in sorted(self.mel_base_path.rglob(f"*{self.suffix}")):
+        for path in self._iter_segment_files():
             self.n_files += 1
             parsed = self.parse_segment_name(path)
             if parsed is None:
@@ -172,14 +197,15 @@ class SegmentMelParser:
             labels = self.cycle_labels(sample_id)
             if not labels:
                 self.no_label_file.append(path.name)
-                continue
-            if cycle_idx >= len(labels):
+                raw = name_label
+                self.filename_label_fallback.append(path.name)
+            elif cycle_idx >= len(labels):
                 self.out_of_range.append(f"{path.name} (엑셀 {len(labels)}행)")
                 continue
-
-            raw = labels[cycle_idx]
-            if sanitize(raw) != name_label:
-                self.mismatch.append((path.name, str(raw), name_label))
+            else:
+                raw = labels[cycle_idx]
+                if sanitize(raw) != name_label:
+                    self.mismatch.append((path.name, str(raw), name_label))
 
             label_id = self.parse_label_value(raw)
             if label_id < 0:
@@ -213,13 +239,14 @@ class SegmentMelParser:
             "dropped_labels": dict(self.dropped),
             "unparsed": self.unparsed,
             "no_label_file": self.no_label_file,
+            "filename_label_fallback": self.filename_label_fallback,
             "out_of_range": self.out_of_range,
             "mismatch": self.mismatch,
         }
 
 
 if __name__ == "__main__":
-    from utils import ROOT
+    from data.utils import ROOT
 
     mel_folder = os.path.join(ROOT, "db", "new_gt", "10s_mel")
 
