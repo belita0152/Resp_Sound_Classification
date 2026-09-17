@@ -1,19 +1,7 @@
-"""fold별 train recording에서 NyTT noise bank를 만들되, wheezing이 섞인
-recording(또는 wheezing cycle 주변)을 잡음 후보에서 제외한다.
+"""Wheezing 오염을 제외한 train recording noise bank를 생성한다.
 
-예시
-    # wheezing이 있는 train recording은 통째로 잡음 추출에서 제외
-    python -m denoising.nytt.noise_bank2 --fold 1 --wheeze-mode file \
-        --out /home/coder/workspace/data/db/new_gt/noise_bank_fold1_nowheeze.npz
-
-    # 연속음 3종을 모두 제외 대상으로
-    python -m denoising.nytt.noise_bank2 --fold 1 --wheeze-mode file \
-        --wheeze-labels Wheezing Rhonchi Stridor
-
-    # 파일은 살리고 wheeze cycle 주변 1초만 잘라내기
-    python -m denoising.nytt.noise_bank2 --fold 1 --wheeze-mode cycle \
-        --wheeze-guard-sec 1.0
-
+    python -m denoising.nytt.noise_bank.noise_bank2 --fold 1 \
+        --wheeze-mode file --wheeze-labels Wheezing Rhonchi Stridor
 """
 
 from __future__ import annotations
@@ -22,54 +10,34 @@ import argparse
 import json
 import math
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
-# noise_bank_split.py의 검증된 헬퍼를 그대로 재사용한다 (중복 구현 방지).
-try:
-    from denoising.nytt.noise_bank_split import (
-        DEFAULT_LABEL_DIR,
-        DEFAULT_MANIFEST,
-        DEFAULT_OUTPUT_DIR,
-        DEFAULT_WAV_DIR,
-        SHEET_CANDIDATES,
-        START_COLUMNS,
-        END_COLUMNS,
-        TARGET_SR,
-        _candidate_starts,
-        _is_under,
-        _load_wav,
-        _pick_column,
-        _resample,
-        background_intervals,
-        index_label_files,
-        index_wav_files,
-        read_split_manifest,
-    )
-except ImportError:  # 스크립트로 직접 실행하는 경우
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from noise_bank_split import (  # type: ignore
-        DEFAULT_LABEL_DIR,
-        DEFAULT_MANIFEST,
-        DEFAULT_OUTPUT_DIR,
-        DEFAULT_WAV_DIR,
-        SHEET_CANDIDATES,
-        START_COLUMNS,
-        END_COLUMNS,
-        TARGET_SR,
-        _candidate_starts,
-        _is_under,
-        _load_wav,
-        _pick_column,
-        _resample,
-        background_intervals,
-        index_label_files,
-        index_wav_files,
-        read_split_manifest,
-    )
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from denoising.nytt.noise_bank.noise_bank_split import (
+    DEFAULT_LABEL_DIR,
+    DEFAULT_MANIFEST,
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_WAV_DIR,
+    END_COLUMNS,
+    SHEET_CANDIDATES,
+    START_COLUMNS,
+    TARGET_SR,
+    _candidate_starts,
+    _is_under,
+    _load_wav,
+    _pick_column,
+    _resample,
+    background_intervals,
+    index_label_files,
+    index_wav_files,
+    read_split_manifest,
+)
 
 # data/parser.py의 SegmentMelParser와 동일한 라벨 컬럼 후보
 LABEL_COLUMNS = ("labels", "label", "class", "class_name")
@@ -77,10 +45,15 @@ LABEL_COLUMNS = ("labels", "label", "class", "class_name")
 LABEL_SEPARATORS = ("\n", "/", ";", "+", "&")
 DEFAULT_WHEEZE_LABELS = ("Wheezing",)
 WHEEZE_MODES = ("off", "file", "cycle", "both")
+CONFIG_FIELDS = (
+    "clip_sec", "hop_sec", "max_per_id", "edge_margin_sec", "min_gap_sec",
+    "rms_low_pct", "rms_high_pct", "max_peak", "max_crest_db", "seed",
+    "wheeze_mode", "wheeze_guard_sec", "wheeze_min_count", "wheeze_max_ratio",
+)
 
 
 # --------------------------------------------------------------------- 라벨
-def label_tokens(raw_label) -> List[str]:
+def label_tokens(raw_label) -> list[str]:
     """라벨 셀 하나를 소문자 토큰 리스트로 만든다. 복합 라벨도 모두 분해한다."""
     if raw_label is None or (isinstance(raw_label, float) and pd.isna(raw_label)):
         return []
@@ -130,7 +103,7 @@ def read_cycle_table(xlsx_path: Path) -> pd.DataFrame:
     raise RuntimeError(f"cycle 시간 컬럼을 찾을 수 없습니다: {xlsx_path}")
 
 
-def wheeze_mask(table: pd.DataFrame, wheeze_labels: Set[str]) -> np.ndarray:
+def wheeze_mask(table: pd.DataFrame, wheeze_labels: set[str]) -> np.ndarray:
     """각 cycle이 연속음(기본 Wheezing) 라벨을 포함하는지."""
     if table.empty:
         return np.zeros(0, dtype=bool)
@@ -142,22 +115,22 @@ def wheeze_mask(table: pd.DataFrame, wheeze_labels: Set[str]) -> np.ndarray:
 
 # ----------------------------------------------------------------- 구간 연산
 def subtract_intervals(
-    base: Sequence[Tuple[float, float]],
-    blocked: Sequence[Tuple[float, float]],
+    base: Sequence[tuple[float, float]],
+    blocked: Sequence[tuple[float, float]],
     min_length_sec: float,
-) -> List[Tuple[float, float]]:
+) -> list[tuple[float, float]]:
     """base 구간에서 blocked 구간을 뺀다. min_length_sec 미만 조각은 버린다."""
     if not blocked:
         return [(s, e) for s, e in base if e - s >= min_length_sec]
 
-    merged: List[List[float]] = []
+    merged: list[list[float]] = []
     for start, end in sorted((float(s), float(e)) for s, e in blocked):
         if merged and start <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], end)
         else:
             merged.append([start, end])
 
-    result: List[Tuple[float, float]] = []
+    result: list[tuple[float, float]] = []
     for start, end in base:
         cursor = float(start)
         for block_start, block_end in merged:
@@ -175,19 +148,12 @@ def subtract_intervals(
     return result
 
 
-def wheeze_guard_intervals(
-    table: pd.DataFrame,
-    mask: np.ndarray,
-    guard_sec: float,
-    total_sec: float,
-) -> List[Tuple[float, float]]:
-    """wheezing cycle 앞뒤로 guard_sec 만큼 넓힌 '접근 금지' 구간."""
-    blocked = []
-    for start, end in table.loc[mask, ["start_sec", "end_sec"]].itertuples(
-        index=False, name=None
-    ):
-        blocked.append((max(0.0, start - guard_sec), min(total_sec, end + guard_sec)))
-    return blocked
+def _print_progress(index: int, total: int, sample_id: str, n_clips: int,
+                    status: str = "") -> None:
+    if index % 25 == 0 or index == total:
+        prefix = f"{status} — " if status else ""
+        print(f"  [{index:>3}/{total}] {sample_id}  "
+              f"{prefix}누적 background clips: {n_clips:,}")
 
 
 # ------------------------------------------------------------------- 추출
@@ -195,8 +161,8 @@ def extract_noise_bank(
     *,
     train_ids: Sequence[str],
     test_ids: Sequence[str],
-    wav_paths: Dict[str, Path],
-    label_paths: Dict[str, Path],
+    wav_paths: dict[str, Path],
+    label_paths: dict[str, Path],
     raw_wav_root: Path,
     clip_sec: float,
     hop_sec: float,
@@ -205,11 +171,11 @@ def extract_noise_bank(
     min_gap_sec: float,
     seed: int,
     wheeze_mode: str,
-    wheeze_labels: Set[str],
+    wheeze_labels: set[str],
     wheeze_guard_sec: float,
     wheeze_min_count: int,
     wheeze_max_ratio: float,
-) -> Tuple[np.ndarray, pd.DataFrame, List[str], pd.DataFrame]:
+) -> tuple[np.ndarray, pd.DataFrame, list[str], pd.DataFrame]:
     """train recording의 cycle 여집합에서 고정 길이 background clip을 만든다.
 
     wheeze_mode에 따라 wheezing 오염 recording/구간을 잡음 후보에서 제외한다.
@@ -218,10 +184,10 @@ def extract_noise_bank(
     clip_samples = int(round(clip_sec * TARGET_SR))
     hop_samples = int(round(hop_sec * TARGET_SR))
     rng = np.random.default_rng(seed)
-    clips: List[np.ndarray] = []
-    rows: List[dict] = []
-    report_rows: List[dict] = []
-    zero_clip_ids: List[str] = []
+    clips: list[np.ndarray] = []
+    rows: list[dict] = []
+    report_rows: list[dict] = []
+    zero_clip_ids: list[str] = []
 
     skip_file = wheeze_mode in ("file", "both")
     apply_guard = wheeze_mode in ("cycle", "both")
@@ -240,23 +206,30 @@ def extract_noise_bank(
         n_wheeze = int(mask.sum())
         wheeze_ratio = (n_wheeze / n_cycles) if n_cycles else 0.0
         has_label_col = table.attrs.get("label_column") is not None
+        report_row = {
+            "sample_id": sample_id,
+            "n_cycles": n_cycles,
+            "n_wheeze_cycles": n_wheeze,
+            "wheeze_ratio": round(wheeze_ratio, 4),
+            "has_label_column": has_label_col,
+        }
 
-        excluded = False
-        reason = ""
-        if skip_file and n_wheeze >= wheeze_min_count and wheeze_ratio > wheeze_max_ratio:
-            excluded = True
-            reason = f"wheeze cycle {n_wheeze}/{n_cycles} ({wheeze_ratio:.1%})"
+        excluded = (
+            skip_file
+            and n_wheeze >= wheeze_min_count
+            and wheeze_ratio > wheeze_max_ratio
+        )
 
         if excluded:
             report_rows.append({
-                "sample_id": sample_id, "n_cycles": n_cycles,
-                "n_wheeze_cycles": n_wheeze, "wheeze_ratio": round(wheeze_ratio, 4),
-                "has_label_column": has_label_col, "excluded": True,
-                "exclude_reason": reason, "n_clips": 0,
+                **report_row,
+                "excluded": True,
+                "exclude_reason": (
+                    f"wheeze cycle {n_wheeze}/{n_cycles} ({wheeze_ratio:.1%})"
+                ),
+                "n_clips": 0,
             })
-            if index % 25 == 0 or index == len(train_ids):
-                print(f"  [{index:>3}/{len(train_ids)}] {sample_id}  "
-                      f"제외(wheeze) — 누적 clips: {len(clips):,}")
+            _print_progress(index, len(train_ids), sample_id, len(clips), "제외(wheeze)")
             continue
 
         waveform, original_sr = _load_wav(wav_path)
@@ -270,16 +243,21 @@ def extract_noise_bank(
             edge_margin_sec=edge_margin_sec,
             min_gap_sec=max(min_gap_sec, clip_sec),
         )
-        n_guard_blocked = 0
+        guarded_cycles = 0
         if apply_guard and n_wheeze:
-            blocked = wheeze_guard_intervals(table, mask, wheeze_guard_sec, total_sec)
-            before = len(gaps)
+            blocked = [
+                (max(0.0, start - wheeze_guard_sec),
+                 min(total_sec, end + wheeze_guard_sec))
+                for start, end in table.loc[
+                    mask, ["start_sec", "end_sec"]
+                ].itertuples(index=False, name=None)
+            ]
+            guarded_cycles = len(blocked)
             gaps = subtract_intervals(gaps, blocked, max(min_gap_sec, clip_sec))
-            n_guard_blocked = before - len(gaps)
 
-        starts = _candidate_starts(gaps, clip_samples, hop_samples)
-        if starts:
-            starts = [starts[i] for i in rng.permutation(len(starts))]
+        starts = rng.permutation(
+            _candidate_starts(gaps, clip_samples, hop_samples)
+        ).tolist()
 
         accepted = 0
         for start in starts:
@@ -312,16 +290,14 @@ def extract_noise_bank(
         if accepted == 0:
             zero_clip_ids.append(sample_id)
         report_rows.append({
-            "sample_id": sample_id, "n_cycles": n_cycles,
-            "n_wheeze_cycles": n_wheeze, "wheeze_ratio": round(wheeze_ratio, 4),
-            "has_label_column": has_label_col, "excluded": False,
-            "exclude_reason": (f"guard {n_guard_blocked} gaps" if n_guard_blocked else ""),
+            **report_row,
+            "excluded": False,
+            "exclude_reason": (
+                f"guard {guarded_cycles} wheeze cycles" if guarded_cycles else ""
+            ),
             "n_clips": accepted,
         })
-
-        if index % 25 == 0 or index == len(train_ids):
-            print(f"  [{index:>3}/{len(train_ids)}] {sample_id}  "
-                  f"누적 background clips: {len(clips):,}")
+        _print_progress(index, len(train_ids), sample_id, len(clips))
 
     if not clips:
         raise RuntimeError(
@@ -349,6 +325,84 @@ def extract_noise_bank(
                 f"wheeze 제외 대상 recording이 noise bank에 남았습니다: {contaminated}"
             )
     return np.stack(clips), metadata, zero_clip_ids, report
+
+
+def filter_clips(
+    clips: np.ndarray,
+    metadata: pd.DataFrame,
+    *,
+    rms_percentiles: tuple[float, float],
+    max_peak: float,
+    max_crest_db: float | None,
+) -> tuple[np.ndarray, pd.DataFrame, dict[str, int]]:
+    """RMS, peak, crest factor 순서로 clip을 필터링한다."""
+    low, high = np.percentile(metadata["rms"], rms_percentiles)
+    keep = metadata["rms"].between(low, high, inclusive="both")
+    removed = {"rms": int((~keep).sum()), "peak": 0, "crest": 0}
+
+    rejected = metadata["peak"].ge(max_peak)
+    removed["peak"] = int((rejected & keep).sum())
+    keep &= ~rejected
+
+    if max_crest_db is not None:
+        rejected = metadata["crest_db"].gt(max_crest_db)
+        removed["crest"] = int((rejected & keep).sum())
+        keep &= ~rejected
+
+    filtered_metadata = metadata.loc[keep].reset_index(drop=True)
+    if filtered_metadata.empty:
+        raise RuntimeError("필터를 통과한 background clip이 없습니다.")
+    return clips[keep.to_numpy()], filtered_metadata, removed
+
+
+def save_noise_bank(
+    output_path: Path,
+    clips: np.ndarray,
+    metadata: pd.DataFrame,
+    report: pd.DataFrame,
+    train_ids: Sequence[str],
+    test_ids: Sequence[str],
+    args: argparse.Namespace,
+    paths: dict[str, Path],
+    wheeze_labels: set[str],
+) -> tuple[list[str], list[str]]:
+    """NoiseBank 호환 NPZ를 임시 파일에 쓴 뒤 원자적으로 교체한다."""
+    source_ids = sorted(metadata["sample_id"].unique().tolist())
+    excluded_ids = sorted(report.loc[report["excluded"], "sample_id"].tolist())
+    config = {name: getattr(args, name) for name in CONFIG_FIELDS}
+    config.update({
+        "fold": args.fold,
+        "manifest": str(paths["manifest"]),
+        "raw_wav_root": str(paths["wav"]),
+        "label_root": str(paths["label"]),
+        "source_kind": "full_recording_wav",
+        "target_sr": TARGET_SR,
+        "wheeze_labels": sorted(wheeze_labels),
+        "wheeze_excluded_ids": excluded_ids,
+    })
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(f"{output_path.name}.tmp.npz")
+    np.savez_compressed(
+        temporary_path,
+        clips=clips.astype(np.float32, copy=False),
+        sr=np.int64(TARGET_SR),
+        meta=metadata.to_records(index=False),
+        source_ids=np.asarray(source_ids, dtype=object),
+        train_ids=np.asarray(train_ids, dtype=object),
+        test_ids=np.asarray(test_ids, dtype=object),
+        train_only=np.bool_(True),
+        fold=np.int64(args.fold),
+        manifest_path=np.asarray(str(paths["manifest"]), dtype=object),
+        source_kind=np.asarray("full_recording_wav", dtype=object),
+        wheeze_mode=np.asarray(args.wheeze_mode, dtype=object),
+        wheeze_labels=np.asarray(sorted(wheeze_labels), dtype=object),
+        wheeze_excluded_ids=np.asarray(excluded_ids, dtype=object),
+        recording_report=report.to_records(index=False),
+        config_json=np.asarray(json.dumps(config, ensure_ascii=False), dtype=object),
+    )
+    temporary_path.replace(output_path)
+    return source_ids, excluded_ids
 
 
 # -------------------------------------------------------------------- CLI
@@ -458,6 +512,8 @@ def main() -> None:
         )
 
     wheeze_labels = {name.strip().lower() for name in args.wheeze_labels if name.strip()}
+    if not wheeze_labels:
+        raise ValueError("--wheeze-labels에 빈 문자열만 주어졌습니다.")
     suffix = "" if args.wheeze_mode == "off" else f"_{args.wheeze_mode}"
     output_path = (
         args.out if args.out is not None
@@ -469,24 +525,14 @@ def main() -> None:
             "덮어쓰려면 --overwrite를 명시하십시오."
         )
 
-    print("=" * 78)
-    print(f"fold             : {args.fold}")
-    print(f"manifest         : {manifest_path}")
-    print(f"train/test IDs   : {len(train_ids)} / {len(test_ids)}")
-    print(f"WAV source root  : {raw_wav_root}")
-    print(f"label root       : {label_root}")
-    print(f"WAV files indexed: {len(wav_ids):,}")
-    print("source kind      : 원본 전체 recording WAV (10s_repeat/10s_mel 미사용)")
-    print(f"wheeze mode      : {args.wheeze_mode}  labels={sorted(wheeze_labels)}")
-    if args.wheeze_mode in ("file", "both"):
-        print(f"  file 제외 기준 : wheeze cycle >= {args.wheeze_min_count}개 "
-              f"and 비율 > {args.wheeze_max_ratio:.2%}")
-    if args.wheeze_mode in ("cycle", "both"):
-        print(f"  cycle guard    : wheeze cycle 앞뒤 ±{args.wheeze_guard_sec:g}s 제외")
-    print(f"output           : {output_path}")
-    print(f"clip/hop         : {args.clip_sec:g}s / {args.hop_sec:g}s, "
-          f"ID당 최대 {args.max_per_id}개")
-    print("=" * 78)
+    print(
+        f"[noise_bank2] fold={args.fold} train/test={len(train_ids)}/{len(test_ids)} "
+        f"wav={len(wav_ids):,}\n"
+        f"  mode={args.wheeze_mode} labels={sorted(wheeze_labels)} "
+        f"guard={args.wheeze_guard_sec:g}s\n"
+        f"  clip/hop={args.clip_sec:g}/{args.hop_sec:g}s "
+        f"max_per_id={args.max_per_id} output={output_path}"
+    )
 
     clips, metadata, zero_clip_ids, report = extract_noise_bank(
         train_ids=train_ids,
@@ -507,117 +553,47 @@ def main() -> None:
         wheeze_max_ratio=args.wheeze_max_ratio,
     )
     extracted_count = len(metadata)
-
-    low, high = np.percentile(
-        metadata["rms"].to_numpy(), [args.rms_low_pct, args.rms_high_pct],
+    clips, metadata, removed = filter_clips(
+        clips,
+        metadata,
+        rms_percentiles=(args.rms_low_pct, args.rms_high_pct),
+        max_peak=args.max_peak,
+        max_crest_db=args.max_crest_db,
     )
-    keep = metadata["rms"].between(low, high, inclusive="both")
-    rms_removed = int((~keep).sum())
-    clipped = metadata["peak"].ge(args.max_peak)
-    peak_removed = int((clipped & keep).sum())
-    keep &= ~clipped
-    crest_removed = 0
-    if args.max_crest_db is not None:
-        impulsive = metadata["crest_db"].gt(args.max_crest_db)
-        crest_removed = int((impulsive & keep).sum())
-        keep &= ~impulsive
-
-    clips = clips[keep.to_numpy()]
-    metadata = metadata.loc[keep].reset_index(drop=True)
-    if len(metadata) == 0:
-        raise RuntimeError("필터를 통과한 background clip이 없습니다.")
-
-    source_ids = sorted(metadata["sample_id"].unique().tolist())
-    leaked = sorted(set(source_ids) & set(test_ids))
-    if leaked:
-        raise RuntimeError(f"저장 직전 누수 검사 실패 — test IDs: {leaked}")
-
-    wheeze_excluded_ids = sorted(report.loc[report["excluded"], "sample_id"].tolist())
-    still_in = sorted(set(source_ids) & set(wheeze_excluded_ids))
-    if still_in:
-        raise RuntimeError(f"저장 직전 wheeze 오염 검사 실패: {still_in}")
-
-    config = {
-        "fold": args.fold,
-        "manifest": str(manifest_path),
-        "raw_wav_root": str(raw_wav_root),
-        "label_root": str(label_root),
-        "source_kind": "full_recording_wav",
-        "target_sr": TARGET_SR,
-        "clip_sec": args.clip_sec,
-        "hop_sec": args.hop_sec,
-        "max_per_id": args.max_per_id,
-        "edge_margin_sec": args.edge_margin_sec,
-        "min_gap_sec": args.min_gap_sec,
-        "rms_low_pct": args.rms_low_pct,
-        "rms_high_pct": args.rms_high_pct,
-        "max_peak": args.max_peak,
-        "max_crest_db": args.max_crest_db,
-        "seed": args.seed,
-        "wheeze_mode": args.wheeze_mode,
-        "wheeze_labels": sorted(wheeze_labels),
-        "wheeze_guard_sec": args.wheeze_guard_sec,
-        "wheeze_min_count": args.wheeze_min_count,
-        "wheeze_max_ratio": args.wheeze_max_ratio,
-        "wheeze_excluded_ids": wheeze_excluded_ids,
-    }
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_name(output_path.name + ".tmp.npz")
-    np.savez_compressed(
-        temporary_path,
-        clips=clips.astype(np.float32, copy=False),
-        sr=np.int64(TARGET_SR),
-        meta=metadata.to_records(index=False),
-        source_ids=np.asarray(source_ids, dtype=object),
-        train_ids=np.asarray(train_ids, dtype=object),
-        test_ids=np.asarray(test_ids, dtype=object),
-        train_only=np.bool_(True),
-        fold=np.int64(args.fold),
-        manifest_path=np.asarray(str(manifest_path), dtype=object),
-        source_kind=np.asarray("full_recording_wav", dtype=object),
-        wheeze_mode=np.asarray(args.wheeze_mode, dtype=object),
-        wheeze_labels=np.asarray(sorted(wheeze_labels), dtype=object),
-        wheeze_excluded_ids=np.asarray(wheeze_excluded_ids, dtype=object),
-        recording_report=report.to_records(index=False),
-        config_json=np.asarray(json.dumps(config, ensure_ascii=False), dtype=object),
+    source_ids, wheeze_excluded_ids = save_noise_bank(
+        output_path,
+        clips,
+        metadata,
+        report,
+        train_ids,
+        test_ids,
+        args,
+        {"manifest": manifest_path, "wav": raw_wav_root, "label": label_root},
+        wheeze_labels,
     )
-    temporary_path.replace(output_path)
 
     if args.report_csv is not None:
         report_path = args.report_csv.resolve()
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report.to_csv(report_path, index=False, encoding="utf-8-sig")
 
-    n_no_label_col = int((~report["has_label_column"]).sum())
-    print("\n" + "=" * 78)
-    print("noise bank 생성 완료")
-    print("=" * 78)
-    print(f"추출/채택 clips : {extracted_count:,} / {len(metadata):,}")
-    print(f"RMS 제외        : {rms_removed:,}")
-    print(f"peak 제외       : {peak_removed:,} (peak >= {args.max_peak:g})")
-    print(f"crest 제외      : {crest_removed:,}")
-    print(f"source train IDs: {len(source_ids):,} / 요청 {len(train_ids):,}")
-    print(f"test ID 누수    : 0")
-    print(f"총 길이         : {len(metadata) * args.clip_sec / 60:.1f}분")
-    print("-" * 78)
-    print(f"wheeze mode     : {args.wheeze_mode}")
-    print(f"wheeze 보유 ID  : {int((report['n_wheeze_cycles'] > 0).sum()):,} / "
-          f"{len(report):,}")
-    print(f"wheeze 제외 ID  : {len(wheeze_excluded_ids):,}")
-    if wheeze_excluded_ids:
-        preview = wheeze_excluded_ids[:10]
-        print(f"  예시          : {preview}"
-              + (" ..." if len(wheeze_excluded_ids) > len(preview) else ""))
-    if n_no_label_col:
-        print(f"★ 라벨 컬럼을 못 찾은 recording {n_no_label_col}개 — "
+    no_label_count = int((~report["has_label_column"]).sum())
+    print(
+        f"\n[noise_bank2] 완료: clips={extracted_count:,}->{len(metadata):,} "
+        f"(RMS/peak/crest 제외={removed['rms']}/{removed['peak']}/{removed['crest']}), "
+        f"IDs={len(source_ids)}/{len(train_ids)}, {len(metadata) * args.clip_sec / 60:.1f}분\n"
+        f"  wheeze ID={int((report['n_wheeze_cycles'] > 0).sum()):,}, "
+        f"제외 ID={len(wheeze_excluded_ids):,}, test 누수=0"
+    )
+    if no_label_count:
+        print(f"★ 라벨 컬럼을 못 찾은 recording {no_label_count}개 — "
               f"wheezing 판정이 불가능해 그대로 사용했습니다. 라벨 엑셀을 확인하십시오.")
     if zero_clip_ids:
         print(f"추출 clip 0개 ID: {len(zero_clip_ids)}개 "
               f"(충분히 긴 background가 없음) — {zero_clip_ids}")
     if args.report_csv is not None:
         print(f"recording report: {args.report_csv.resolve()}")
-    print(f"저장             : {output_path}")
+    print(f"저장: {output_path}")
 
 
 if __name__ == "__main__":
