@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from data.data_loader import LungSegmentDataset
 from data.utils import mel_folder, wave_folder
-from denoising.nytt.noise_bank_loader import NoiseBank
+from denoising.nytt.noise_bank import NoiseBank
 
 DATA_ROOT = PROJECT_ROOT.parent
 DEFAULT_SPLIT_MANIFEST = PROJECT_ROOT / "data" / "splits" / "split_manifest_5x60_40.csv"
@@ -166,7 +166,7 @@ def load_noise_bank(args, train_ids, test_ids):
         if noise_augmentation:
             raise FileNotFoundError(
                 f"B arm noise bank 없음: {path}\n"
-                f"  python -m denoising.nytt.noise_bank_split --fold {args.fold} "
+                f"  python -m denoising.nytt.noise_bank.noise_bank_split --fold {args.fold} "
                 "를 먼저 실행하세요."
             )
         print("[noise] A-prime 학습에는 noise bank가 필요하지 않습니다. "
