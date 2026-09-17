@@ -1,8 +1,7 @@
 """
 [1단계] noise_bank.py   원본 wav + 라벨 엑셀  →  noise_bank.npz  (잡음 clip 모음)
 
-[2단계] nytt.py         10s_repeat/*.wav + noise_bank.npz  →  학습된 모델
-                        매 배치마다 잡음을 꺼내 섞어서 denoiser를 학습.
+[2단계] model_vN.py & train_vN.py       10s_repeat/*.wav + noise_bank.npz  →  noise bank로 denoiser 학습.
 
 
 # Noise bank — clean reference 없이 '잡음만 있는 구간' 을 자기 데이터에서 추출
@@ -33,12 +32,13 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
+import librosa
 import numpy as np
 import pandas as pd
 import soundfile as sf
 
 CURRENT_DIR = Path(__file__).resolve().parent
-UTILS_ROOT = CURRENT_DIR.parents[1]  # /home/coder/workspace/data/classification
+UTILS_ROOT = CURRENT_DIR.parents[2]  # project root
 
 sys.path.insert(0, str(UTILS_ROOT))
 
@@ -116,7 +116,6 @@ def load_wav(path) -> Tuple[np.ndarray, int]:
 def resample(y: np.ndarray, sr: int, target: int) -> np.ndarray:
     if sr == target:
         return y
-    import librosa
     return librosa.resample(y, orig_sr=sr, target_sr=target).astype(np.float32)
 
 
@@ -240,14 +239,9 @@ def main():
     keep &= ~clipped
 
     # ③ crest factor = 20·log10(peak/rms)
-    #    ★ 이 값이 크다는 것은 클립이 '정상 배경음' 이 아니라
-    #      충격성 아티팩트(청진기 마찰, 두드림, 몸부림) 라는 뜻이다.
-    #          백색잡음     ~12.5 dB
-    #          정상 배경음  12–16 dB
-    #          접촉 아티팩트 18–29 dB
-    #      충격성 잡음만 주입하면 denoiser 는 '충격음을 지우는 함수' 가 되고,
-    #      crackle 도 충격성 신호이므로 같이 지워진다. crackle 은 가장 드물고
-    #      임상적으로 가장 중요한 클래스라 이 실패는 치명적이다.
+    #    ★ 이 값이 크다는 것은 클립이 '정상 배경음' 이 아니라 충격성 아티팩트(청진기 마찰, 두드림, 몸부림) 라는 뜻이다.
+    #      충격성 잡음만 주입하면 denoiser 는 '충격음을 지우는 함수' 가 되고, crackle 도 충격성 신호이므로 같이 지워진다.
+
     n_crest = 0
     if a.max_crest_db is not None:
         too_impulsive = df["crest_db"] > a.max_crest_db
@@ -337,9 +331,8 @@ class NoiseBank:
           2 초마다 계단 모양 불연속이 생기고, 그것 자체가 충격성 신호다.
           denoiser 가 그 인공 클릭을 지우도록 학습되면 crackle 도 같이 지운다.
 
-        서로 무관한 잡음이므로 등전력(equal-power) 페이드를 쓴다.
+        ★ 서로 무관한 잡음이므로 등전력(equal-power) 페이드를 쓴다.
             w_in = √t,  w_out = √(1-t)   →   w_in² + w_out² = 1  (전력 보존)
-        선형 페이드는 중점에서 3 dB 가 꺼진다.
         """
         clip_len = self.clips.shape[1]
         fade = min(max(1, int(self.sr * fade_ms / 1000)), clip_len // 4)
