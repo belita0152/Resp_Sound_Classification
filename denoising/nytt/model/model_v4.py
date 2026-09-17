@@ -417,7 +417,7 @@ class MultiViewMelClassifier(nn.Module):
 
 
 class NyTTClassifier(nn.Module):
-    def __init__(self, dae: DUNet | None, num_classes: int = 5,
+    def __init__(self, dunet: DUNet | None, num_classes: int = 5,
                  base: int = 32, dropout: float = 0.1,
                  mel_normalize: str = "minmax", top_db: float = 80.0,
                  cls_dim: int = 32,
@@ -429,8 +429,8 @@ class NyTTClassifier(nn.Module):
                  cls_view_dim=None,
                  n_mels: int = 64, mel_fmax: float = 2000.0):
         super().__init__()
-        self.dae = dae
-        self.use_denoiser = dae is not None
+        self.dunet = dunet
+        self.use_denoiser = dunet is not None
         self.frontend = LogMelExtractor(normalize=mel_normalize, top_db=top_db,
                                          n_mels=n_mels, fmax=mel_fmax)
         self.view_frontends = None
@@ -461,10 +461,10 @@ class NyTTClassifier(nn.Module):
         return [frontend(x) for frontend in self.view_frontends]
 
     def forward(self, x: torch.Tensor):
-        if self.dae is None:
+        if self.dunet is None:
             return None, self.classifier(self.extract_mels(x))
 
-        x_hat = self.dae(x)
+        x_hat = self.dunet(x)
         rms_in = x.pow(2).mean(dim=(1, 2), keepdim=True).sqrt()
         rms_hat = x_hat.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-8)
         x_norm = x_hat * (rms_in / rms_hat)
