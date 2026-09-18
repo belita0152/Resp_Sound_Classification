@@ -475,9 +475,11 @@ def get_args():
                    help="view 별 n_mels. 미지정이면 64에서 시작해 n_fft 가 감당할 수 "
                         "있는 수로 자동으로 줄인다(n_fft=256 → 32). "
                         "'tonal=64,transient=32' 형식도 가능")
-    p.add_argument("--cls_pool", default="avg",
+
+    p.add_argument("--cls_pool", default="attn",
                    choices=["avg", "attn"])
     p.add_argument("--dropout", default=0.1, type=float)
+
 
     p.add_argument("--no_denoise", action="store_true",
                    help="denoiser 를 아예 만들지 않는다 (A / A′ arm)")
