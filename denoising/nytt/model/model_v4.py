@@ -253,7 +253,7 @@ VIEW_POOLS = {
     "transient": ((2, 1),) * 4,
     "square": ((2, 2),) * 4,
 }
-VIEW_FREQ_KEEP = {"tonal": 16, "transient": 4, "square": 4}
+VIEW_FREQ_KEEP = {"tonal": 32, "transient": 4, "square": 4}
 VIEW_NFFT = {"tonal": 2048, "transient": 512, "square": 1024}
 VIEW_REDUCED_DIM = 128
 
